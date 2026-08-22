@@ -397,13 +397,20 @@ if [[ "${APP_ALREADY_EXISTED:-0}" == "1" ]]; then
     echo "    Site is down after ${down}s; starting it again"
   fi
 
+  # Start the clock BEFORE the start call, not after. `az webapp start` blocks
+  # until the platform reports the site running, so the cold start happens
+  # inside this command. Timing only the poll loop afterwards reports 0s.
+  T_STARTUP_BEGIN=$(date +%s)
   az webapp start --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" -o none 2>/dev/null || true
 fi
 
 echo "    Upload/deploy took ${T_UPLOAD_SECS}s"
 echo "==> Waiting up to ${HEALTH_TIMEOUT}s for the app to come up at $URL"
 
-elapsed=0
+# When no cycle ran there is nothing to back-date to, so start from now.
+: "${T_STARTUP_BEGIN:=$(date +%s)}"
+elapsed=$(( $(date +%s) - T_STARTUP_BEGIN ))
+polls=0
 while (( elapsed < HEALTH_TIMEOUT )); do
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "${URL}${HEALTH_PATH}" || true)"
   if [[ "$code" == "200" ]]; then
@@ -422,7 +429,10 @@ while (( elapsed < HEALTH_TIMEOUT )); do
 
   # Fail fast. After repeated cold-start failures App Service gives up and stops
   # the site outright, at which point no amount of further polling will help.
-  if (( elapsed > 0 && elapsed % 60 == 0 )); then
+  # Counted in poll iterations, not `elapsed`, because `elapsed` is back-dated to
+  # the moment the start was issued and so is not a multiple of the poll interval.
+  polls=$(( polls + 1 ))
+  if (( polls % 6 == 0 )); then
     state="$(az webapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" \
       --query state -o tsv 2>/dev/null || true)"
     if [[ "$state" == "Stopped" ]]; then
@@ -438,7 +448,7 @@ while (( elapsed < HEALTH_TIMEOUT )); do
 
   echo "    ${elapsed}s: HTTP ${code:-none}, retrying in 10s"
   sleep 10
-  elapsed=$(( elapsed + 10 ))
+  elapsed=$(( $(date +%s) - T_STARTUP_BEGIN ))
 done
 
 echo "==> App did not become healthy within ${HEALTH_TIMEOUT}s. Check the logs:" >&2

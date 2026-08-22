@@ -316,7 +316,13 @@ Three defences, all of which belong in any redeploy script:
    until it stops answering, then start it and time the recovery. If it never
    stops answering, say the measurement is untrustworthy rather than reporting
    it.
-3. **Treat a failed upload as fatal when there is no remote build to rescue
+3. **Start the stopwatch before `az webapp start`, not after.** Unlike `stop`,
+   `az webapp start` *blocks* until the platform reports the site running, so
+   the entire cold start happens inside that one command. Timing only the poll
+   loop that follows it reports `startup 0s` even though the cycle worked
+   correctly and the site genuinely went down. This one is especially
+   convincing, because every other part of the measurement looks right.
+4. **Treat a failed upload as fatal when there is no remote build to rescue
    it.** The "an HTTP 504 here is cosmetic" rule is true *only* for remote
    builds, where the gateway gives up but the server-side build continues. In
    the default path, where dependencies ship with the code, a failed upload
