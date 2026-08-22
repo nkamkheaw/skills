@@ -1,38 +1,28 @@
 #!/usr/bin/env bash
 #
-# Deploy a Python web app to Azure App Service (Linux) and make it publicly
-# reachable over HTTPS.
+# Deploy a Python web app to Azure App Service (Linux), publicly over HTTPS.
 #
-# Streamlit, FastAPI, Flask and Gradio are detected automatically from
-# requirements.txt; nothing needs configuring for a conventional layout. Every
-# derived value can be overridden from the environment -- see "framework
-# detection" below. Do not copy this script into a project to change it.
+# Streamlit, FastAPI, Flask and Gradio are detected from requirements.txt, so a
+# conventional project needs no configuration. Every derived value is
+# overridable from the environment (see "framework detection"). Do not copy this
+# script into a project to change it -- a fork stops inheriting fixes.
 #
 # Usage:
 #   ./deploy.sh <app-name> [resource-group] [region]
-#   ./deploy.sh <app-name> --detach          # returns immediately, deploys in background
-#   ./deploy.sh <app-name> --remote-build    # let Azure install dependencies instead
+#   ./deploy.sh <app-name> --detach          # deploy in background, return now
+#   ./deploy.sh <app-name> --remote-build    # let Azure install dependencies
 #   ./deploy.sh --status <app-name>          # progress of a detached deploy
 #   ./deploy.sh --show-config                # print detected settings, deploy nothing
 #
-# <app-name> must be globally unique across Azure — it becomes the hostname
-# https://<app-name>.azurewebsites.net
+# <app-name> must be globally unique across Azure -- it becomes the hostname
+# https://<app-name>.azurewebsites.net. Everything is created in one resource
+# group, so `az group delete` is a complete teardown.
 #
-# Dependencies are installed locally as linux/x86_64 wheels and shipped with the
-# code, because that is the faster of the two options here. Measured on this app
-# over a ~1 MB/s uplink:
-#
-#   default (dependencies shipped)   ~27s packaging + ~303s upload + cold start
-#                                    ≈ 6.5-8 min end to end
-#   --remote-build                   840s end to end
-#
-# The upload dominates and is volatile — the same 128 MB payload has taken
-# between ~120s and ~303s across runs — so on a slow or congested connection the
-# advantage narrows and can disappear. --remote-build is also the fallback when
-# a dependency publishes no prebuilt Linux wheel.
-#
-# Everything is created inside one resource group so `az group delete` is a
-# complete teardown.
+# By default dependencies are installed locally as linux/x86_64 wheels and
+# shipped with the code, which is usually faster than --remote-build (~6-8 min
+# vs ~14 min on a ~1 MB/s uplink). The upload dominates and is volatile, so on a
+# slow link the advantage narrows. --remote-build is also the fallback when a
+# dependency publishes no prebuilt Linux wheel.
 
 set -euo pipefail
 
@@ -65,15 +55,11 @@ APP_NAME="${1:-}"
 
 # --- flag parsing ----------------------------------------------------------
 DETACH=0
-# Dependencies are shipped with the code by default; --remote-build opts out and
-# has Azure run pip install instead. See the timing note in the header.
+# Dependencies shipped with the code by default; --remote-build has Azure run
+# pip install instead.
 VENDORED=1
-# Print what was detected and exit without touching Azure. Useful for checking a
-# new project's framework/startup command before spending several minutes on a
-# deploy that was never going to boot.
 SHOW_CONFIG=0
-# Where shipped dependencies live, relative to the site root. This must match
-# the PYTHONPATH app setting below; Oryx will not discover it on its own.
+# Must match the PYTHONPATH app setting below; Oryx will not discover it alone.
 VENDOR_DIR_REL=".python_packages/lib/site-packages"
 args=()
 for a in "$@"; do
@@ -96,11 +82,9 @@ if [[ "$DETACH" == "1" && "${_AZDEPLOY_CHILD:-}" != "1" ]]; then
   # Flags were stripped during parsing, so re-attach them for the child.
   child_flags=()
   [[ "$VENDORED" == "0" ]] && child_flags+=(--remote-build)
-  # Run the child from an immutable snapshot. bash reads a script lazily by byte
-  # offset, so editing this file while a deploy is in flight makes the running
-  # copy jump to the wrong offset and fail with nonsense like
-  # "line 138: t: command not found". Detached runs can last 15 minutes, which is
-  # ample time to want to edit the script, so the child gets its own copy.
+  # Run from an immutable snapshot: bash reads a script lazily by byte offset, so
+  # editing this file mid-deploy makes the running copy jump to the wrong offset
+  # and fail with nonsense like "line 138: t: command not found".
   SNAPSHOT="${RUN_DIR}/deploy-snapshot.sh"
   cp "$0" "$SNAPSHOT"
   chmod +x "$SNAPSHOT"
@@ -120,19 +104,15 @@ RUNTIME="PYTHON:3.14"
 
 # --- framework detection ----------------------------------------------------
 #
-# Everything below is derived, and every derived value can be overridden from
-# the environment. The goal is that a Streamlit, FastAPI, Flask or Gradio app
-# all deploy with no arguments beyond the app name, while an unusual layout
-# stays deployable by setting FRAMEWORK, ENTRYPOINT, APP_MODULE, STARTUP_CMD or
-# HEALTH_PATH explicitly.
+# Derives the entry point, import path, startup command and health path.
+# Override any of FRAMEWORK, ENTRYPOINT, APP_MODULE, STARTUP_CMD, HEALTH_PATH
+# from the environment for an unusual layout.
 #
-# Detection reads requirements.txt rather than importing anything: this script
-# must not need the app's dependencies installed locally to work out how to
-# start it.
+# Reads requirements.txt rather than importing anything: this script must work
+# without the app's dependencies installed locally.
 if [[ -z "${FRAMEWORK:-}" && -f requirements.txt ]]; then
-  # Match the distribution name at the start of a requirement line, so that a
-  # transitive mention (e.g. "fastapi" inside a comment, or "streamlit-foo")
-  # does not win. Order matters: check the more specific names first.
+  # Anchor to the start of a requirement line so "streamlit-authenticator" does
+  # not read as streamlit. Most specific names first.
   for candidate in streamlit gradio fastapi flask; do
     if grep -qiE "^[[:space:]]*${candidate}([[:space:]]*[=<>!~[]|$)" requirements.txt; then
       FRAMEWORK="$candidate"
@@ -143,7 +123,7 @@ fi
 FRAMEWORK="${FRAMEWORK:-unknown}"
 
 # Entry point file. Streamlit and Gradio run a script; FastAPI and Flask are
-# served from an import path, but the file still has to exist to be validated.
+# served from an import path, but the file must still exist to be validated.
 if [[ -z "${ENTRYPOINT:-}" ]]; then
   case "$FRAMEWORK" in
     fastapi) preferred=(main.py app.py) ;;
@@ -155,15 +135,13 @@ if [[ -z "${ENTRYPOINT:-}" ]]; then
 fi
 ENTRYPOINT="${ENTRYPOINT:-app.py}"
 
-# Import path for the ASGI/WSGI servers: "<module>:<attribute>", where the
-# module is the entry point's filename without the extension.
+# Import path for uvicorn/gunicorn: "<module>:<attribute>".
 APP_MODULE="${APP_MODULE:-$(basename "$ENTRYPOINT" .py):app}"
 
-# The command App Service runs to start the container. Whatever the framework,
-# it must bind 0.0.0.0:8000 -- App Service routes external traffic to port 8000,
-# and no Python web server defaults to both that port and a non-loopback
-# address. A wrong or missing startup command is the most common cause of a
-# failed deploy.
+# App Service routes external traffic to port 8000 and no Python web server
+# defaults to both that port and a non-loopback address, so every startup
+# command must bind 0.0.0.0:8000. Getting this wrong is the most common cause of
+# a failed deploy.
 if [[ -z "${STARTUP_CMD:-}" ]]; then
   case "$FRAMEWORK" in
     streamlit)
@@ -185,9 +163,9 @@ if [[ -z "${STARTUP_CMD:-}" ]]; then
   esac
 fi
 
-# Flask is served by gunicorn, which is not a Flask dependency: without it in
-# requirements.txt the container starts and immediately dies on "No module
-# named gunicorn". Catch that here rather than in a startup log.
+# Flask is served by gunicorn, which is not a Flask dependency: without it the
+# container starts and dies on "No module named gunicorn". Catch it here rather
+# than in a startup log.
 if [[ "$FRAMEWORK" == "flask" && "$STARTUP_CMD" == *gunicorn* ]] \
    && ! grep -qiE '^[[:space:]]*gunicorn([[:space:]]*[=<>!~[]|$)' requirements.txt; then
   echo "error: Flask detected and the startup command uses gunicorn, but" >&2
@@ -220,11 +198,9 @@ fi
 DEPLOY_TIMEOUT="${DEPLOY_TIMEOUT:-900}"   # remote pip install
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-420}"   # container boot after the build
 
-# The path polled to decide the deploy succeeded. Streamlit ships a dedicated
-# health endpoint; everything else falls back to "/", which any web app serves.
-#
-# Prefer a cheap endpoint that does not call a third-party API: if it does, an
-# outage in that dependency reads as a failed deployment.
+# Streamlit ships a dedicated health endpoint; everything else falls back to
+# "/". Prefer a path that does not call a third-party API, or an outage in that
+# dependency reads as a failed deployment.
 if [[ -z "${HEALTH_PATH:-}" ]]; then
   case "$FRAMEWORK" in
     streamlit) HEALTH_PATH="/_stcore/health" ;;
@@ -317,14 +293,10 @@ az webapp config appsettings set \
   --settings "${BUILD_SETTING[@]}" \
   -o none
 
-# Streamlit and Gradio keep a long-lived WebSocket open between browser and
-# server for every widget interaction. App Service does not enable WebSockets by
-# default, and without it the page renders but nothing reacts. It is harmless
-# for frameworks that do not use them, so it is enabled unconditionally.
-#
-# This must run BEFORE the code is deployed. Without a startup command the
-# container falls back to gunicorn auto-detection, fails to boot, and any
-# deploy command that waits for a healthy site will time out.
+# WebSockets are off by default and Streamlit/Gradio need them for every widget
+# interaction; harmless for frameworks that do not. Must run BEFORE deploying:
+# with no startup command the container falls back to gunicorn auto-detection,
+# never boots, and any wait-for-healthy times out.
 echo "==> Configuring WebSockets, Always On and the startup command"
 az webapp config set \
   --name "$APP_NAME" \
@@ -337,14 +309,11 @@ az webapp config set \
 echo "==> Packaging source"
 T_PACKAGE_START=$(date +%s)
 
-# Install dependencies locally for the *target* platform and ship
-# them. Oryx does not look inside .python_packages, so the PYTHONPATH app setting
-# configured earlier is what actually makes these importable.
-#
-# The --platform flags are what make this work from an arm64 Mac: they tell pip
-# to fetch x86_64 Linux wheels rather than wheels for this machine. --only-binary
-# is mandatory alongside them, since anything built from source would compile for
-# the wrong architecture.
+# The --platform flags fetch x86_64 Linux wheels rather than wheels for this
+# machine, which is what makes this work from an arm64 Mac. --only-binary is
+# mandatory alongside them: anything built from source compiles for the wrong
+# architecture. Oryx does not look inside .python_packages, so the PYTHONPATH
+# app setting configured earlier is what makes these importable.
 if [[ "$VENDORED" == "1" ]]; then
   VENDOR_DIR="$VENDOR_DIR_REL"
   echo "    Installing dependencies for linux/x86_64 into ${VENDOR_DIR}"
@@ -375,10 +344,8 @@ UPLOAD_LOG="$(mktemp -t upload-XXXXXX).log"
 if [[ "${_AZDEPLOY_CHILD:-}" != "1" ]]; then
   trap 'rm -f "${ZIP:-}" "${UPLOAD_LOG:-}"' EXIT
 fi
-# -1 (fastest compression). On a payload of a few hundred megabytes the
-# default level costs far more time than the bytes it saves on upload.
-# Deploy tooling is not application payload; shipping a copy of this script to
-# the web root is just dead weight in the upload.
+# -1 (fastest compression): on a few hundred megabytes the default level costs
+# more time than the bytes it saves. deploy.sh is tooling, not app payload.
 zip -r -q -1 "$ZIP" . \
   -x '*.git*' -x '*.venv*' -x '*venv/*' -x '*__pycache__*' \
   -x '*.zip' -x '*.DS_Store' -x '*.pyc' -x 'deploy.sh'
@@ -391,15 +358,14 @@ if [[ "$VENDORED" == "1" ]]; then
 else
   echo "==> Deploying source (Oryx will install requirements.txt remotely)"
 fi
-# Use the classic ZipDeploy endpoint rather than `az webapp deploy`. The newer
-# OneDeploy path reports "Deployment successful" with zero errors but does not
-# reliably create the `antenv` virtual environment for Python, which leaves the
-# container crash-looping on "No module named <your framework>".
+# Classic ZipDeploy, not `az webapp deploy`: the newer OneDeploy path reports
+# "Deployment successful" with zero errors but does not reliably create the
+# `antenv` virtual environment, leaving the container crash-looping on "No
+# module named <framework>".
 #
-# Run it in the background against a wall-clock deadline. A remote pip install
-# routinely outlives the Kudu gateway's patience, which surfaces as a spurious
-# HTTP 504 while the build carries on regardless -- so a hang here must not be
-# allowed to block the script forever.
+# Run against a wall-clock deadline. A remote pip install routinely outlives the
+# Kudu gateway's patience, surfacing as a spurious HTTP 504 while the build
+# carries on regardless, so a hang here must not block the script forever.
 az webapp deployment source config-zip \
   --name "$APP_NAME" \
   --resource-group "$RESOURCE_GROUP" \
@@ -421,16 +387,12 @@ while kill -0 "$deploy_pid" 2>/dev/null; do
     echo "    building... ${waited}s elapsed"
   fi
 done
-# A non-zero exit here means different things in the two modes.
-#
-# Remote build: the Kudu gateway routinely gives up (HTTP 504) while the build
-# carries on server-side, so a failure is often cosmetic and worth riding out.
-#
-# With dependencies shipped, there is no remote build to rescue it: a failed
-# upload means the new payload never landed -- and because the previous
-# deployment is still running and still healthy, the health check below would
-# sail through on stale code and report a success that never happened. Fail
-# loudly instead.
+# A non-zero exit means different things in the two modes. Remote build: the
+# Kudu gateway routinely gives up (HTTP 504) while the build carries on, so a
+# failure is often cosmetic. With dependencies shipped there is no remote build
+# to rescue it -- the payload never landed, and since the previous deployment is
+# still healthy the health check would sail through on stale code and report a
+# success that never happened. Fail loudly instead.
 if ! wait "$deploy_pid"; then
   echo "    Upload command failed. Azure said:" >&2
   sed 's/^/      /' "${UPLOAD_LOG}" | grep -v 'SyntaxWarning\|^\s*$' | tail -15 >&2
@@ -449,44 +411,25 @@ fi
 # Make the health check below capable of failing.
 #
 # Redeploying over a running app leaves the previous container serving traffic,
-# so the health endpoint answers 200 the instant it is asked -- from the old
-# code. `az webapp restart` is not enough: it returns immediately and the
-# recycle happens asynchronously, so the poll still races the old container and
-# reports "Healthy after 0s".
+# so the health endpoint answers 200 instantly -- from the old code. Neither
+# `az webapp restart` nor `az webapp stop` is enough on its own: both return
+# before the platform has finished, and App Service deliberately keeps the old
+# worker answering while a replacement warms up. Observing a non-200 is the only
+# proof the old container is gone.
 #
-# Stop the site, wait until it genuinely stops answering, then start it again.
-# `az webapp stop` returns before the platform has finished, and App Service
-# keeps the previous worker serving while a replacement warms up, so neither a
-# restart nor a bare stop guarantees the old container is gone. Observing a
-# non-200 is the only reliable proof; see the loop below.
-#
-# This runs after the upload, never before it: the Kudu/SCM endpoint that
-# receives the ZipDeploy is unreachable while the site is stopped, and in
-# remote-build mode the Oryx build has to finish first.
-#
-# Skipped on a first-ever deploy, where there is no previous container to be
-# fooled by and the site may not be running yet anyway.
+# Runs after the upload, never before: the Kudu/SCM endpoint is unreachable
+# while the site is stopped, and remote builds must finish first. Skipped on a
+# first-ever deploy, where there is no previous container to be fooled by.
 URL="https://${APP_NAME}.azurewebsites.net"
 
-# Close out the upload measurement before cycling the site, so the time spent
-# waiting for the old container to die is not billed to the upload phase.
+# Close out the upload measurement before cycling, so time spent waiting for the
+# old container to die is not billed to the upload phase.
 T_UPLOAD_SECS=$(( $(date +%s) - T_DEPLOY_START ))
 
 if [[ "${APP_ALREADY_EXISTED:-0}" == "1" ]]; then
   echo "    Cycling the site so the health check tests the new payload, not the old one"
   az webapp stop --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" -o none 2>/dev/null || true
 
-  # Wait for the site to actually go down before starting it again.
-  #
-  # Neither `az webapp restart` nor `az webapp stop` is enough on its own. Both
-  # return before the platform has finished, and App Service deliberately keeps
-  # the previous worker answering requests while a new one warms up -- that is
-  # its zero-downtime behaviour. The result is a health endpoint that returns
-  # 200 without interruption straight through a redeploy, which is exactly the
-  # false "Healthy after 0s" this is meant to prevent.
-  #
-  # Observing a non-200 is the only proof the old container is genuinely gone,
-  # so the timer below measures a real cold start of the new payload.
   down=0
   while (( down < 120 )); do
     dcode="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${URL}${HEALTH_PATH}" || true)"
@@ -495,17 +438,17 @@ if [[ "${APP_ALREADY_EXISTED:-0}" == "1" ]]; then
     down=$(( down + 5 ))
   done
   if (( down >= 120 )); then
-    # Rather than silently measure the wrong thing, say so. The deploy itself is
-    # fine; only the startup timing below is untrustworthy.
+    # Say so rather than silently measuring the wrong thing. The deploy is fine;
+    # only the startup timing below is untrustworthy.
     echo "    WARNING: site still answering 200 after ${down}s of being stopped." >&2
     echo "    The startup time below may reflect the old container, not the new one." >&2
   else
     echo "    Site is down after ${down}s; starting it again"
   fi
 
-  # Start the clock BEFORE the start call, not after. `az webapp start` blocks
-  # until the platform reports the site running, so the cold start happens
-  # inside this command. Timing only the poll loop afterwards reports 0s.
+  # Start the clock BEFORE the start call. `az webapp start` blocks until the
+  # site is running, so the cold start happens inside it; timing only the poll
+  # loop afterwards reports 0s.
   T_STARTUP_BEGIN=$(date +%s)
   az webapp start --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" -o none 2>/dev/null || true
 fi

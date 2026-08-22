@@ -20,81 +20,86 @@ az account set --subscription "<NAME OR ID>"
 ```
 
 A Visual Studio Enterprise subscription includes a **$150/month Azure credit**
-for dev/test. To activate: create a personal Microsoft account, sign in to
-`my.visualstudio.com` with your work account, add the personal address as an
-alternate email, activate the Azure benefit, then sign in to `portal.azure.com`
-with the **personal** account. A $0 spending limit is on by default and no
-credit card is required, so exhausting the credit suspends rather than bills.
+for dev/test. To activate: create a personal Microsoft account, add it as an
+alternate email on `my.visualstudio.com`, activate the Azure benefit, then sign
+in to `portal.azure.com` with the **personal** account. A $0 spending limit is
+on by default and no credit card is required, so exhausting the credit suspends
+rather than bills.
 
 ## Step 1 — run it locally first
 
 Never debug a framework problem and a hosting problem at the same time.
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/python -m streamlit run app.py
-```
-
-`requirements.txt` must exist and pin versions, or the app crashes on first import.
+`requirements.txt` must exist and pin versions, or the app crashes on import.
 
 ## Step 2 — deploy
 
-`APP_NAME` must be **globally unique**; it becomes
-`https://<APP_NAME>.azurewebsites.net`. Keep everything in one resource group so
-teardown is a single command.
+```bash
+~/.copilot/skills/azure-python-deploy/deploy.sh <app-name> --detach
+~/.copilot/skills/azure-python-deploy/deploy.sh --status <app-name>
+```
+
+`<app-name>` must be **globally unique**; it becomes
+`https://<app-name>.azurewebsites.net`. Everything lands in one resource group,
+so teardown is a single command.
+
+The script detects Streamlit / FastAPI / Flask / Gradio from `requirements.txt`
+and derives the entry point, import path, startup command and health path. A
+conventional project needs no configuration. Check what it inferred without
+deploying:
 
 ```bash
-APP_NAME="my-unique-app-name"
-RESOURCE_GROUP="rg-${APP_NAME}"
-LOCATION="centralus"
-PLAN_NAME="plan-${APP_NAME}"
+~/.copilot/skills/azure-python-deploy/deploy.sh --show-config
+```
 
-az group create --name "$RESOURCE_GROUP" --location "$LOCATION"
+Detection fails closed: an unrecognised framework is an error naming
+`STARTUP_CMD`, never a guess that deploys and fails to boot. Flask without
+`gunicorn` in `requirements.txt` is rejected up front.
 
-az appservice plan create --name "$PLAN_NAME" --resource-group "$RESOURCE_GROUP" \
-  --location "$LOCATION" --sku B1 --is-linux
+**Do not copy `deploy.sh` into the project to change it.** A fork stops
+inheriting fixes and ships to the web root as app payload. Override in place:
 
-az webapp create --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" \
-  --plan "$PLAN_NAME" --runtime "PYTHON:3.14"
+| Variable | Default |
+|---|---|
+| `FRAMEWORK` | detected from `requirements.txt` |
+| `ENTRYPOINT` | `main.py` for FastAPI, else `app.py` |
+| `APP_MODULE` | `<entrypoint stem>:app` |
+| `STARTUP_CMD` | from `FRAMEWORK` |
+| `HEALTH_PATH` | `/_stcore/health` for Streamlit, else `/` |
 
-# Install dependencies locally as x86_64 Linux wheels. --only-binary is
-# mandatory with --platform: anything built from source targets this machine.
-rm -rf .python_packages
+```bash
+APP_MODULE=main:api HEALTH_PATH=/health \
+  ~/.copilot/skills/azure-python-deploy/deploy.sh <app-name> --detach
+```
+
+Pick a `HEALTH_PATH` that does not call a third-party API — otherwise an outage
+in that dependency reads as a failed deployment.
+
+### What the script does, if you must do it by hand
+
+`az group create` → `az appservice plan create --sku B1 --is-linux` →
+`az webapp create --runtime PYTHON:3.14` → ship dependencies → configure →
+`az webapp deployment source config-zip`. The parts that are not obvious:
+
+```bash
+# x86_64 Linux wheels. --only-binary is mandatory with --platform: anything
+# built from source targets this machine instead.
 pip install -r requirements.txt --target .python_packages/lib/site-packages \
   --platform manylinux_2_28_x86_64 --platform manylinux_2_17_x86_64 \
   --platform any --only-binary=:all: --python-version 3.14 --no-compile
 
-# Both required: disable the server-side build, and put the shipped packages on
-# the path — App Service does NOT add .python_packages by itself.
-az webapp config appsettings set --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" \
+# Both required. App Service does NOT add .python_packages to the path itself.
+az webapp config appsettings set --name "$APP_NAME" --resource-group "$RG" \
   --settings SCM_DO_BUILD_DURING_DEPLOYMENT=false \
              PYTHONPATH=/home/site/wwwroot/.python_packages/lib/site-packages
 
-# Configure BEFORE deploying. With no startup command the container falls back
-# to gunicorn auto-detection and never boots.
-az webapp config set --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" \
-  --web-sockets-enabled true --always-on true \
-  --startup-file "<see table below>"
-
-# -1 is fastest compression; on this payload compressing harder costs more time
-# than the bytes save.
-ZIP="$(mktemp -t deploy-XXXXXX).zip"
-zip -r -q -1 "$ZIP" . -x '*.git*' -x '*.venv*' -x '*venv/*' -x '*__pycache__*' -x '*.pyc'
-
-# config-zip, NOT `az webapp deploy` — see traps.
-az webapp deployment source config-zip \
-  --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --src "$ZIP"
-rm -f "$ZIP"
+# BEFORE deploying. With no startup command the container falls back to
+# gunicorn auto-detection and never boots.
+az webapp config set --name "$APP_NAME" --resource-group "$RG" \
+  --web-sockets-enabled true --always-on true --startup-file "<see table>"
 ```
 
-Then poll the health endpoint; expect `000`/`503` for a minute or two of cold start.
-
-### Startup command by framework
-
-App Service routes traffic to **port 8000** inside the container and no Python
-framework defaults to it. A wrong or missing startup command is the single most
-common cause of a failed deploy.
+App Service routes traffic to **port 8000** and no Python framework defaults to
+it. A wrong startup command is the single most common cause of a failed deploy.
 
 | Framework | `--startup-file` |
 |---|---|
@@ -103,49 +108,9 @@ common cause of a failed deploy.
 | Flask | `python -m gunicorn --bind 0.0.0.0:8000 app:app` (add `gunicorn` to requirements) |
 | Gradio | `python app.py`, with `demo.launch(server_name="0.0.0.0", server_port=8000)` |
 
-`deploy.sh` picks the right row itself. It detects the framework from
-`requirements.txt` and derives the entry point, import path, startup command and
-health path, so a conventional project needs no configuration:
-
-```bash
-~/.copilot/skills/azure-python-deploy/deploy.sh <app-name> --detach
-```
-
-Check what it inferred before spending several minutes on a deploy:
-
-```bash
-~/.copilot/skills/azure-python-deploy/deploy.sh --show-config
-```
-
-**Do not copy `deploy.sh` into the project to change its behaviour.** A fork
-silently stops inheriting fixes, and gets uploaded to the web root as part of
-the app. Every derived value is an environment variable, so override in place:
-
-| Variable | Meaning | Default |
-|---|---|---|
-| `FRAMEWORK` | `streamlit` / `fastapi` / `flask` / `gradio` | detected from `requirements.txt` |
-| `ENTRYPOINT` | app file | `main.py` for FastAPI, else `app.py` |
-| `APP_MODULE` | import path for uvicorn/gunicorn | `<entrypoint stem>:app` |
-| `STARTUP_CMD` | full startup command | from `FRAMEWORK` |
-| `HEALTH_PATH` | path polled to confirm success | `/_stcore/health` for Streamlit, else `/` |
-
-```bash
-# e.g. a non-standard attribute name and a dedicated health route
-APP_MODULE=main:api HEALTH_PATH=/health \
-  ~/.copilot/skills/azure-python-deploy/deploy.sh <app-name> --detach
-```
-
-Detection fails closed: an unrecognised framework is an error telling you to set
-`STARTUP_CMD`, never a guess that deploys and fails to boot. Flask without
-`gunicorn` in `requirements.txt` is also rejected up front rather than dying in
-a startup log.
-
-Prefer a `HEALTH_PATH` that does not call a third-party API. If it does, an
-outage in that dependency reads as a failed deployment.
-
-`--web-sockets-enabled true` is off by default; Streamlit and Gradio need it for
-every widget, and without it the page renders but nothing reacts.
-`--always-on true` avoids a cold start after ~20 idle minutes and needs B1+.
+`--web-sockets-enabled true` is off by default; Streamlit and Gradio need it or
+the page renders but nothing reacts. `--always-on true` avoids a cold start
+after ~20 idle minutes and needs B1+.
 
 ## Traps
 
@@ -172,41 +137,37 @@ These all report success while doing nothing useful.
 ### If `az appservice plan create` fails on quota
 
 New Visual Studio Enterprise subscriptions have **zero virtual machine quota**
-in most regions (`Current Limit (Total VMs): 0`). B1+ are dedicated virtual
-machines, so they need it. Switching region is almost always faster than filing
-a quota request — `centralus` had quota when `eastus`, `westus` and `westus2`
-did not. `--sku F1` needs no quota but cannot enable Always On.
+in most regions (`Current Limit (Total VMs): 0`), and B1+ are dedicated virtual
+machines. Switching region beats filing a quota request — `centralus` had quota
+when `eastus`, `westus` and `westus2` did not. `--sku F1` needs no quota but
+cannot enable Always On.
 
 ### Do not block the conversation while deploying
 
-A deploy takes several minutes. Run it detached (`nohup` to a log file, final
-exit status written to a `status` file from an `EXIT` trap), then schedule a
-wake-up and end the turn — see the waiting-and-polling instructions. Never
-`sleep` for minutes in the foreground, and note that detaching achieves nothing
-if you then block on a poll loop instead. `deploy.sh --detach` and
-`deploy.sh --status <app>` do this; `--status` exits 0 success / 1 failed /
-2 running so it is easy to branch on.
+Run detached, schedule a wake-up, end the turn — see the waiting-and-polling
+instructions. Never `sleep` for minutes in the foreground; detaching achieves
+nothing if you then block on a poll loop. `--status` exits 0 success / 1 failed
+/ 2 running, so it is easy to branch on.
 
-Also: **editing a shell script while it is running corrupts it**, because bash
-reads by byte offset. Snapshot the script before launching a long run.
+**Editing a shell script while it runs corrupts it** — bash reads by byte
+offset. `--detach` snapshots itself for this reason.
 
 ### Fallback — let Azure install the dependencies
 
-If your uplink is slow or a dependency has no prebuilt Linux wheel, skip the
-local `pip install`, set `SCM_DO_BUILD_DURING_DEPLOYMENT=true`, drop the
-`PYTHONPATH` setting, and zip the source only. Azure then runs `pip install`
-server-side. Simpler and a much smaller upload, but roughly twice as slow
-end to end and you cannot watch the build.
+`--remote-build` sets `SCM_DO_BUILD_DURING_DEPLOYMENT=true` and zips the source
+only. Use it when the uplink is slow or a dependency has no prebuilt Linux
+wheel. Much smaller upload, roughly twice as slow end to end, and you cannot
+watch the build.
 
 ## Step 3 — verify it is public
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' "https://${APP_NAME}.azurewebsites.net/"
-curl -s "https://${APP_NAME}.azurewebsites.net/_stcore/health"   # Streamlit
 ```
 
-Also open it in a browser and click something: a 200 proves HTTP works, not the
-WebSocket.
+Open it in a browser and click something: a 200 proves HTTP works, not the
+WebSocket. Expect `000`/`503` for a minute or two of cold start, and one slow
+first request after any redeploy.
 
 ## Step 4 — debugging a failed start
 
@@ -249,22 +210,19 @@ authentication ("Easy Auth") if you need a login.
 
 **The plan costs money, not the app.** A B1 Linux plan is ~$13/month and bills
 from creation whether or not anything runs on it — about 9% of a $150 credit,
-each. One plan can host many apps, so reuse it rather than creating another:
+each. One plan hosts many apps, so reuse it:
 
 ```bash
 az webapp create --name "another-app" --resource-group "$RESOURCE_GROUP" \
   --plan "$PLAN_NAME" --runtime "PYTHON:3.14"
 
-# What is actually billing
 az appservice plan list --query "[].{name:name,sku:sku.name,apps:numberOfSites}" -o table
-
-# Complete teardown
-az group delete --name "$RESOURCE_GROUP" --yes --no-wait
+az group delete --name "$RESOURCE_GROUP" --yes --no-wait   # complete teardown
 ```
 
-Delete test deployments as soon as they have proven their point — they are the
-easiest thing to forget and each one is a recurring charge.
+Delete test deployments as soon as they have proven their point — each is a
+recurring charge and the easiest thing to forget.
 
-**Alternative:** if the app should scale to zero and cost nothing while idle,
-use `az containerapp up --source . --ingress external --target-port 8000`
-instead. Cheaper idle, but adds cold starts and more concepts.
+**Alternative:** to scale to zero and cost nothing while idle, use
+`az containerapp up --source . --ingress external --target-port 8000`. Cheaper
+idle, but adds cold starts and more concepts.
