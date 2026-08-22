@@ -270,7 +270,6 @@ UPLOAD_LOG="$(mktemp -t upload-XXXXXX).log"
 if [[ "${_AZDEPLOY_CHILD:-}" != "1" ]]; then
   trap 'rm -f "${ZIP:-}" "${UPLOAD_LOG:-}"' EXIT
 fi
-cleanup_zip() { rm -f "$ZIP" "${UPLOAD_LOG:-}"; }
 # -1 (fastest compression). On a payload of a few hundred megabytes the
 # default level costs far more time than the bytes it saves on upload.
 zip -r -q -1 "$ZIP" . \
