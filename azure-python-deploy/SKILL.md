@@ -103,6 +103,46 @@ common cause of a failed deploy.
 | Flask | `python -m gunicorn --bind 0.0.0.0:8000 app:app` (add `gunicorn` to requirements) |
 | Gradio | `python app.py`, with `demo.launch(server_name="0.0.0.0", server_port=8000)` |
 
+`deploy.sh` picks the right row itself. It detects the framework from
+`requirements.txt` and derives the entry point, import path, startup command and
+health path, so a conventional project needs no configuration:
+
+```bash
+~/.copilot/skills/azure-python-deploy/deploy.sh <app-name> --detach
+```
+
+Check what it inferred before spending several minutes on a deploy:
+
+```bash
+~/.copilot/skills/azure-python-deploy/deploy.sh --show-config
+```
+
+**Do not copy `deploy.sh` into the project to change its behaviour.** A fork
+silently stops inheriting fixes, and gets uploaded to the web root as part of
+the app. Every derived value is an environment variable, so override in place:
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `FRAMEWORK` | `streamlit` / `fastapi` / `flask` / `gradio` | detected from `requirements.txt` |
+| `ENTRYPOINT` | app file | `main.py` for FastAPI, else `app.py` |
+| `APP_MODULE` | import path for uvicorn/gunicorn | `<entrypoint stem>:app` |
+| `STARTUP_CMD` | full startup command | from `FRAMEWORK` |
+| `HEALTH_PATH` | path polled to confirm success | `/_stcore/health` for Streamlit, else `/` |
+
+```bash
+# e.g. a non-standard attribute name and a dedicated health route
+APP_MODULE=main:api HEALTH_PATH=/health \
+  ~/.copilot/skills/azure-python-deploy/deploy.sh <app-name> --detach
+```
+
+Detection fails closed: an unrecognised framework is an error telling you to set
+`STARTUP_CMD`, never a guess that deploys and fails to boot. Flask without
+`gunicorn` in `requirements.txt` is also rejected up front rather than dying in
+a startup log.
+
+Prefer a `HEALTH_PATH` that does not call a third-party API. If it does, an
+outage in that dependency reads as a failed deployment.
+
 `--web-sockets-enabled true` is off by default; Streamlit and Gradio need it for
 every widget, and without it the page renders but nothing reacts.
 `--always-on true` avoids a cold start after ~20 idle minutes and needs B1+.
@@ -140,11 +180,12 @@ did not. `--sku F1` needs no quota but cannot enable Always On.
 ### Do not block the conversation while deploying
 
 A deploy takes several minutes. Run it detached (`nohup` to a log file, final
-exit status written to a `status` file from an `EXIT` trap), then poll with a
-single short command that returns immediately. Never `sleep` for minutes in the
-foreground — detaching achieves nothing if the poll loop blocks instead.
-`deploy.sh --detach` and `deploy.sh --status <app>` do this; `--status` exits
-0 success / 1 failed / 2 running so it is easy to branch on.
+exit status written to a `status` file from an `EXIT` trap), then schedule a
+wake-up and end the turn — see the waiting-and-polling instructions. Never
+`sleep` for minutes in the foreground, and note that detaching achieves nothing
+if you then block on a poll loop instead. `deploy.sh --detach` and
+`deploy.sh --status <app>` do this; `--status` exits 0 success / 1 failed /
+2 running so it is easy to branch on.
 
 Also: **editing a shell script while it is running corrupts it**, because bash
 reads by byte offset. Snapshot the script before launching a long run.

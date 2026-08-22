@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 #
-# Deploy a Streamlit app to Azure App Service (Linux) and make it publicly
+# Deploy a Python web app to Azure App Service (Linux) and make it publicly
 # reachable over HTTPS.
+#
+# Streamlit, FastAPI, Flask and Gradio are detected automatically from
+# requirements.txt; nothing needs configuring for a conventional layout. Every
+# derived value can be overridden from the environment -- see "framework
+# detection" below. Do not copy this script into a project to change it.
 #
 # Usage:
 #   ./deploy.sh <app-name> [resource-group] [region]
 #   ./deploy.sh <app-name> --detach          # returns immediately, deploys in background
 #   ./deploy.sh <app-name> --remote-build    # let Azure install dependencies instead
 #   ./deploy.sh --status <app-name>          # progress of a detached deploy
+#   ./deploy.sh --show-config                # print detected settings, deploy nothing
 #
 # <app-name> must be globally unique across Azure — it becomes the hostname
 # https://<app-name>.azurewebsites.net
@@ -62,6 +68,10 @@ DETACH=0
 # Dependencies are shipped with the code by default; --remote-build opts out and
 # has Azure run pip install instead. See the timing note in the header.
 VENDORED=1
+# Print what was detected and exit without touching Azure. Useful for checking a
+# new project's framework/startup command before spending several minutes on a
+# deploy that was never going to boot.
+SHOW_CONFIG=0
 # Where shipped dependencies live, relative to the site root. This must match
 # the PYTHONPATH app setting below; Oryx will not discover it on its own.
 VENDOR_DIR_REL=".python_packages/lib/site-packages"
@@ -70,6 +80,7 @@ for a in "$@"; do
   case "$a" in
     --detach)       DETACH=1 ;;
     --remote-build) VENDORED=0 ;;
+    --show-config)  SHOW_CONFIG=1 ;;
     # Accepted for compatibility with older invocations; this is now the default.
     --vendored)     VENDORED=1 ;;
     *)              args+=("$a") ;;
@@ -106,7 +117,83 @@ LOCATION="${3:-centralus}"
 PLAN_NAME="plan-${APP_NAME}"
 SKU="B1"
 RUNTIME="PYTHON:3.14"
+
+# --- framework detection ----------------------------------------------------
+#
+# Everything below is derived, and every derived value can be overridden from
+# the environment. The goal is that a Streamlit, FastAPI, Flask or Gradio app
+# all deploy with no arguments beyond the app name, while an unusual layout
+# stays deployable by setting FRAMEWORK, ENTRYPOINT, APP_MODULE, STARTUP_CMD or
+# HEALTH_PATH explicitly.
+#
+# Detection reads requirements.txt rather than importing anything: this script
+# must not need the app's dependencies installed locally to work out how to
+# start it.
+if [[ -z "${FRAMEWORK:-}" && -f requirements.txt ]]; then
+  # Match the distribution name at the start of a requirement line, so that a
+  # transitive mention (e.g. "fastapi" inside a comment, or "streamlit-foo")
+  # does not win. Order matters: check the more specific names first.
+  for candidate in streamlit gradio fastapi flask; do
+    if grep -qiE "^[[:space:]]*${candidate}([[:space:]]*[=<>!~[]|$)" requirements.txt; then
+      FRAMEWORK="$candidate"
+      break
+    fi
+  done
+fi
+FRAMEWORK="${FRAMEWORK:-unknown}"
+
+# Entry point file. Streamlit and Gradio run a script; FastAPI and Flask are
+# served from an import path, but the file still has to exist to be validated.
+if [[ -z "${ENTRYPOINT:-}" ]]; then
+  case "$FRAMEWORK" in
+    fastapi) preferred=(main.py app.py) ;;
+    *)       preferred=(app.py main.py) ;;
+  esac
+  for f in "${preferred[@]}"; do
+    [[ -f "$f" ]] && ENTRYPOINT="$f" && break
+  done
+fi
 ENTRYPOINT="${ENTRYPOINT:-app.py}"
+
+# Import path for the ASGI/WSGI servers: "<module>:<attribute>", where the
+# module is the entry point's filename without the extension.
+APP_MODULE="${APP_MODULE:-$(basename "$ENTRYPOINT" .py):app}"
+
+# The command App Service runs to start the container. Whatever the framework,
+# it must bind 0.0.0.0:8000 -- App Service routes external traffic to port 8000,
+# and no Python web server defaults to both that port and a non-loopback
+# address. A wrong or missing startup command is the most common cause of a
+# failed deploy.
+if [[ -z "${STARTUP_CMD:-}" ]]; then
+  case "$FRAMEWORK" in
+    streamlit)
+      STARTUP_CMD="python -m streamlit run ${ENTRYPOINT} --server.port 8000 --server.address 0.0.0.0 --server.headless true" ;;
+    fastapi)
+      STARTUP_CMD="python -m uvicorn ${APP_MODULE} --host 0.0.0.0 --port 8000" ;;
+    flask)
+      STARTUP_CMD="python -m gunicorn --bind 0.0.0.0:8000 ${APP_MODULE}" ;;
+    gradio)
+      # Gradio has no host/port flags; the app must call
+      # demo.launch(server_name="0.0.0.0", server_port=8000) itself.
+      STARTUP_CMD="python ${ENTRYPOINT}" ;;
+    *)
+      echo "error: could not detect the web framework from requirements.txt." >&2
+      echo "       Set STARTUP_CMD explicitly, e.g." >&2
+      echo "         STARTUP_CMD='python -m uvicorn main:app --host 0.0.0.0 --port 8000'" >&2
+      echo "       It must bind 0.0.0.0 on port 8000." >&2
+      exit 2 ;;
+  esac
+fi
+
+# Flask is served by gunicorn, which is not a Flask dependency: without it in
+# requirements.txt the container starts and immediately dies on "No module
+# named gunicorn". Catch that here rather than in a startup log.
+if [[ "$FRAMEWORK" == "flask" && "$STARTUP_CMD" == *gunicorn* ]] \
+   && ! grep -qiE '^[[:space:]]*gunicorn([[:space:]]*[=<>!~[]|$)' requirements.txt; then
+  echo "error: Flask detected and the startup command uses gunicorn, but" >&2
+  echo "       gunicorn is not in requirements.txt. Add it." >&2
+  exit 2
+fi
 
 # When running detached, record the final outcome so --status can report it
 # without the caller having to parse the log.
@@ -133,11 +220,21 @@ fi
 DEPLOY_TIMEOUT="${DEPLOY_TIMEOUT:-900}"   # remote pip install
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-420}"   # container boot after the build
 
-# Streamlit's own health endpoint. For a non-Streamlit app set this to "/".
-HEALTH_PATH="${HEALTH_PATH:-/_stcore/health}"
+# The path polled to decide the deploy succeeded. Streamlit ships a dedicated
+# health endpoint; everything else falls back to "/", which any web app serves.
+#
+# Prefer a cheap endpoint that does not call a third-party API: if it does, an
+# outage in that dependency reads as a failed deployment.
+if [[ -z "${HEALTH_PATH:-}" ]]; then
+  case "$FRAMEWORK" in
+    streamlit) HEALTH_PATH="/_stcore/health" ;;
+    *)         HEALTH_PATH="/" ;;
+  esac
+fi
 
-if [[ -z "$APP_NAME" ]]; then
+if [[ -z "$APP_NAME" && "$SHOW_CONFIG" == "0" ]]; then
   echo "usage: $0 <app-name> [resource-group] [region] [--detach] [--remote-build]" >&2
+  echo "       $0 --show-config    # print detected settings without deploying" >&2
   exit 2
 fi
 
@@ -149,6 +246,16 @@ fi
 if [[ ! -f requirements.txt ]]; then
   echo "error: requirements.txt not found in $(pwd)" >&2
   exit 2
+fi
+
+if [[ "$SHOW_CONFIG" == "1" ]]; then
+  printf '%-14s %s\n' \
+    "framework"   "$FRAMEWORK" \
+    "entrypoint"  "$ENTRYPOINT" \
+    "app_module"  "$APP_MODULE" \
+    "health_path" "$HEALTH_PATH" \
+    "startup_cmd" "$STARTUP_CMD"
+  exit 0
 fi
 
 echo "==> Signed in as:"
@@ -210,12 +317,10 @@ az webapp config appsettings set \
   --settings "${BUILD_SETTING[@]}" \
   -o none
 
-# Streamlit keeps a long-lived WebSocket open between browser and server for
-# every widget interaction. App Service does not enable WebSockets by default,
-# and without it the page renders but nothing reacts.
-#
-# App Service routes external traffic to port 8000 on the container, so
-# Streamlit must be told to listen there rather than on its default 8501.
+# Streamlit and Gradio keep a long-lived WebSocket open between browser and
+# server for every widget interaction. App Service does not enable WebSockets by
+# default, and without it the page renders but nothing reacts. It is harmless
+# for frameworks that do not use them, so it is enabled unconditionally.
 #
 # This must run BEFORE the code is deployed. Without a startup command the
 # container falls back to gunicorn auto-detection, fails to boot, and any
@@ -226,7 +331,7 @@ az webapp config set \
   --resource-group "$RESOURCE_GROUP" \
   --web-sockets-enabled true \
   --always-on true \
-  --startup-file "python -m streamlit run ${ENTRYPOINT} --server.port 8000 --server.address 0.0.0.0 --server.headless true" \
+  --startup-file "${STARTUP_CMD}" \
   -o none
 
 echo "==> Packaging source"
@@ -272,9 +377,11 @@ if [[ "${_AZDEPLOY_CHILD:-}" != "1" ]]; then
 fi
 # -1 (fastest compression). On a payload of a few hundred megabytes the
 # default level costs far more time than the bytes it saves on upload.
+# Deploy tooling is not application payload; shipping a copy of this script to
+# the web root is just dead weight in the upload.
 zip -r -q -1 "$ZIP" . \
   -x '*.git*' -x '*.venv*' -x '*venv/*' -x '*__pycache__*' \
-  -x '*.zip' -x '*.DS_Store' -x '*.pyc'
+  -x '*.zip' -x '*.DS_Store' -x '*.pyc' -x 'deploy.sh'
 echo "    Upload size: $(du -h "$ZIP" | cut -f1)"
 echo "    Packaging took $(( $(date +%s) - T_PACKAGE_START ))s"
 
