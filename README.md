@@ -1,8 +1,13 @@
 # skills
 
-Reusable [Copilot skills](https://docs.github.com/copilot). Each directory holds
-one skill: a `SKILL.md` with frontmatter that tells the agent when to load it,
-plus any reference implementation the skill refers to.
+Reusable agent skills. Each directory holds one skill: a `SKILL.md` with
+frontmatter that tells the agent when to load it, plus any reference
+implementation the skill refers to.
+
+The format is deliberately plain — Markdown with a small YAML frontmatter block,
+and shell scripts alongside it. Nothing here is tied to a particular assistant or
+tool, so a skill can be dropped into any harness that reads skill files, pasted
+in as context, or simply read by a human.
 
 ## Skills
 
@@ -12,15 +17,18 @@ plus any reference implementation the skill refers to.
 
 ## Installing
 
-Copy a skill directory into your personal skills directory:
+Clone the repository and copy the skill directory into wherever your agent looks
+for skills:
 
 ```bash
 git clone https://github.com/nkamkheaw/skills.git
-cp -r skills/azure-python-deploy ~/.copilot/skills/
+cp -r skills/azure-python-deploy <your-skills-directory>/
 ```
 
-The agent discovers it automatically from the `description` in the frontmatter —
-there is nothing to register.
+Most harnesses load skills from a directory of their own and pick them up from
+the `description` in the frontmatter, so there is usually nothing to register. If
+yours has no skill mechanism at all, `SKILL.md` still works read as a runbook or
+handed to the model as context.
 
 ## What these are written to be
 
