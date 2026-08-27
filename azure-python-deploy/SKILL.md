@@ -34,8 +34,9 @@ Never debug a framework problem and a hosting problem at the same time.
 ## Step 2 — deploy
 
 ```bash
-~/.copilot/skills/azure-python-deploy/deploy.sh <app-name> --detach
-~/.copilot/skills/azure-python-deploy/deploy.sh --status <app-name>
+SKILL_DIR=<the directory holding this SKILL.md>   # wherever the harness installed it
+"$SKILL_DIR/deploy.sh" <app-name> --detach
+"$SKILL_DIR/deploy.sh" --status <app-name>
 ```
 
 `<app-name>` must be **globally unique**; it becomes
@@ -48,7 +49,7 @@ conventional project needs no configuration. Check what it inferred without
 deploying:
 
 ```bash
-~/.copilot/skills/azure-python-deploy/deploy.sh --show-config
+"$SKILL_DIR/deploy.sh" --show-config
 ```
 
 Detection fails closed: an unrecognised framework is an error naming
@@ -68,7 +69,7 @@ inheriting fixes and ships to the web root as app payload. Override in place:
 
 ```bash
 APP_MODULE=main:api HEALTH_PATH=/health \
-  ~/.copilot/skills/azure-python-deploy/deploy.sh <app-name> --detach
+  "$SKILL_DIR/deploy.sh" <app-name> --detach
 ```
 
 Pick a `HEALTH_PATH` that does not call a third-party API — otherwise an outage
