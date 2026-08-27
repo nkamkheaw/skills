@@ -1,6 +1,6 @@
 ---
 name: azure-python-deploy
-description: Deploy a Python web application (Streamlit, Flask, FastAPI, or Gradio) to Azure App Service so it is publicly reachable on the internet over HTTPS. Use when the user says "deploy this to Azure", "put this app online", "host my Python app", "make this Streamlit app public", "azure app service", or asks how to spend their Visual Studio Enterprise Azure credit. Covers the Azure Command-Line Interface deploy sequence, the startup command and WebSocket settings App Service does not set by default, the silent failures that make a first deploy fail, running the deploy detached so a long build never blocks the conversation, debugging a container that will not start, and teardown. NOT for production services, which should not run on a personal Azure subscription.
+description: Deploy a Python web application (Streamlit, Flask, FastAPI, or Gradio) to Azure App Service so it is publicly reachable on the internet over HTTPS. Use when the user says "deploy this to Azure", "put this app online", "host my Python app", "make this Streamlit app public", "azure app service", or asks how to spend their Visual Studio Enterprise Azure credit. Covers the Azure Command-Line Interface deploy sequence, the startup command and WebSocket settings App Service does not set by default, the silent failures that make a first deploy fail, running the deploy detached so a long build never blocks the caller, debugging a container that will not start, and teardown. NOT for production services, which should not run on a personal Azure subscription.
 ---
 
 # Deploy a Python web app to Azure App Service
@@ -34,7 +34,7 @@ Never debug a framework problem and a hosting problem at the same time.
 ## Step 2 — deploy
 
 ```bash
-SKILL_DIR=<the directory holding this SKILL.md>   # wherever the harness installed it
+SKILL_DIR=<the directory holding this SKILL.md>   # wherever this skill is installed
 "$SKILL_DIR/deploy.sh" <app-name> --detach
 "$SKILL_DIR/deploy.sh" --status <app-name>
 ```
@@ -143,12 +143,28 @@ machines. Switching region beats filing a quota request — `centralus` had quot
 when `eastus`, `westus` and `westus2` did not. `--sku F1` needs no quota but
 cannot enable Always On.
 
-### Do not block the conversation while deploying
+### Do not block while the deploy runs
 
-Run detached, schedule a wake-up, end the turn — see the waiting-and-polling
-instructions. Never `sleep` for minutes in the foreground; detaching achieves
-nothing if you then block on a poll loop. `--status` exits 0 success / 1 failed
-/ 2 running, so it is easy to branch on.
+A deploy takes minutes, so anything that waits on it in the foreground stalls
+for that long. Run `--detach`, go and do something else, and poll `--status`
+afterwards. Never `sleep` for minutes in the foreground; detaching achieves
+nothing if you then block on a poll loop instead.
+
+`--status` exits 0 success / 1 failed / 2 running, so a caller can branch on the
+exit code without parsing the log:
+
+```bash
+"$SKILL_DIR/deploy.sh" --status <app-name>
+case $? in
+  0) echo "deployed" ;;
+  1) echo "failed" ;;
+  2) echo "still building" ;;
+esac
+```
+
+An agent with a timer or scheduling mechanism should use it to check back rather
+than waiting inline. A person can watch it directly:
+`tail -f ~/.azure-deploys/<app-name>/log`.
 
 **Editing a shell script while it runs corrupts it** — bash reads by byte
 offset. `--detach` snapshots itself for this reason.
